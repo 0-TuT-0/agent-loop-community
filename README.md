@@ -17,19 +17,19 @@
 
 | | 取值 | 决定什么 | 对应的文件 |
 | --- | --- | --- | --- |
-| 启动器 | `iterm`（WSL 在第三期加入） | 怎么开窗口、关窗口 | [launchers.conf](launchers.conf) 里一个系统一行 |
+| 启动器 | `iterm`（WSL 计划加入，还没有做） | 怎么开窗口、关窗口 | [launchers.conf](launchers.conf) 里一个系统一行 |
 | 总控 | `claude`、`codex` | 总控怎么收通知、怎么把话送回窗口 | `references/coordinator-claude.md`、`references/coordinator-codex.md` |
 
 其余规则和命令两边共用同一份。
 
-Windows 计划通过 WSL 支持，排在第三期，当前版本还没有做。待做的两件事：
+Windows 计划通过 WSL 支持，当前版本还没有做。待做的两件事：
 
 1. 给开窗口加一个 Windows 的实现：用 Windows Terminal 的 `wt.exe new-tab` 在新标签页里启动命令，作为一个新的启动器在 `launchers.conf` 里加一行（开窗、关窗、存活检查三个脚本、名称、怎么判断可用都写在这一行），已有的文件不用改。
 2. 在 WSL 下把 `agent-loop` 命令和各脚本跑一遍，核对路径、符号链接。macOS 与 Linux 的命令差异已经集中在 `scripts/lib/compat.sh`。
 
 原生 Windows（PowerShell、cmd）和 Linux 不在计划内。
 
-总控可以是 Claude Code 或 Codex 命令行；被派工的窗口可以是 Claude、Codex 或其他命令行模型。Codex 当总控的部分已经实现，还没有在项目上完整跑过。
+总控可以是 Claude Code 或 Codex 命令行；被派工的窗口可以是 Claude、Codex 或其他命令行模型。两种总控都在一个小的练习项目上走完过从开发到发布的流程，还没有在大型项目上长期使用过。
 
 ## 安装（每台电脑一次）
 
@@ -327,6 +327,9 @@ Codex 当总控时没有斜杠指令：把「总控」设为 `codex` 后运行 `
 
 ## 后续计划
 
-- **第二期**（已实现，待在项目上实跑验证）：票台账与用量统计；待办清单；回归测试的前提清单和收口；Codex 当总控；系统与总控的隔离。
-- **第三期**：Windows 通过 WSL 支持。
-- **第四期**：Codex 总控下的讨论阶段。现在常驻监视不盯讨论阶段的地图，模块窗口讨论完一张票后需要你对 Codex 总控说一声；也可以讨论阶段用 Claude 总控、开发阶段再换成 Codex。
+- **Windows 通过 WSL 支持**：见上面「支持的系统」一节的说明。
+- **Codex 总控下的讨论阶段**：现在常驻监视不盯讨论阶段的地图，模块窗口讨论完一张票后需要你对 Codex 总控说一声；也可以讨论阶段用 Claude 总控、开发阶段再换成 Codex。
+
+## 许可
+
+[MIT](LICENSE)。
