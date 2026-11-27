@@ -1,0 +1,772 @@
+#!/bin/bash
+# agent-loop 终端命令：设置多窗口开发的参数、开窗并登记、维护票台账和待办清单。不消耗模型调用。
+#
+# 设置
+#   agent-loop                     显示菜单
+#   agent-loop init [--defaults] [--no-open]
+#                                  初始化；已有参数文件时以现值为预填，逐项修改
+#   agent-loop set [<项> [<值>]]   修改一项设置；不带参数时从列表里选。项可以写名称（开发模型）或键（model.dev）
+#                                  关闭「AI文件不提交」只允许个人项目：交互确认，或在值后面加 --personal
+#   agent-loop show                查看当前设置
+#   agent-loop check               检查环境依赖和监视进程
+# 窗口
+#   agent-loop start [<功能名>] [--new] [--print]
+#                                  新建或接续一个功能，开启总控窗口（Claude 或 Codex，按「总控」设置）
+#                                  --new 不恢复登记的会话，开一个全新的会话接手（旧会话太长或出了问题时用）
+#   agent-loop open <规范维护|错误对接> [--print]
+#                                  开启可选窗口；--print 只打印启动命令
+#   agent-loop window open --step <环节> --dir <目录> --prompt <提示文件> [--ticket <票>] [--stage <阶段>] [--model <编号>] [--again] [--print]
+#                                  开一个工作窗口并登记到票台账（总控用）
+#   agent-loop ticket open <票> --prompt <提示文件> [--step dev|plan|fix] [--fix]
+#                                  一张票开工：建 worktree、复制本机专用文件、补票头、开窗并登记（总控用）
+#   agent-loop ticket verify <票>               核对一张完成的票：票头、分支、提交、改动的文件、工作区、完成回报
+#   agent-loop ticket merge <票>                把票分支合入阶段分支或修复分支，登记完成时间和关窗
+#   agent-loop worktree prune [--yes]            列出并清理已经合入的票 worktree（只删 worktree，保留分支）
+#   agent-loop window close <窗口编号|票号>      关窗并登记
+#   agent-loop window list                       列出还开着的窗口
+#   agent-loop send <窗口编号|票号> "<消息>" [--expect <裁决编号>] [--redo <文件>]
+#                                  给一个窗口送消息（Codex 窗口用 codex queue，Claude 窗口用一次性转发）
+# 票台账与用量
+#   agent-loop ledger [<阶段>] [--summary]       查看票台账；--summary 只看按模型汇总
+#   agent-loop usage [<阶段>]                    同 ledger --summary
+#   agent-loop ledger done|rework|plan-revise <票>            记完成时间、返工、计划修改（总控用）
+#   agent-loop ledger audit <票或阶段> <严重程度>=<数量> ...  记审计问题（总控用）
+#   agent-loop ledger source <修复票> <来源票> | snapshot | undo
+# 待办清单
+#   agent-loop todo "<内容>" [--must] [--due <合并前|功能结束前|上生产前>] [--by <谁>]
+#                                  记一条待办：默认是「想法」，--must 记成「遗留」
+#   agent-loop todo [--all]                      查看未处理的条目；--all 连已关闭的一起看
+#   agent-loop todo close <编号> --to <spec|ticket|feature|done|drop|keep> [说明]
+#   agent-loop todo due <编号> <时限>
+# 回归测试与监视
+#   agent-loop regress                           统计各阶段测试结果，生成 regression/summary.md
+#   agent-loop watch wait [--restart] [--timeout <秒>]
+#                                  Claude 总控用：挂成后台任务，功能目录有变化就打印并退出，唤醒总控
+#   agent-loop watch restart --thread <总控会话ID> | status
+#                                  Codex 总控用：常驻监视，有变化时给总控发消息
+#   agent-loop watch stop          停掉这个功能上的所有监视（两种都算），通知记录保留
+#                                  总控启动、恢复、接手时一律重启监视：Claude 用 wait --restart，Codex 用 restart
+#   agent-loop watch redo <文件>    让窗口返工一份已经写过完成标记的文件之前登记，改完后再通知一次
+#   agent-loop watch expect <票> <裁决编号>
+#                                  登记「裁决已送出、等对方接收」，五分钟没被接收时通知
+#
+# 涉及功能目录的命令都可以加 --feature <功能名>；任务目录下只有一个功能时自动选它。
+# 参数文件：<仓库根目录>/docs/agents/loop-profile.md。可枚举的设置在其中的「设置」表里，由本命令维护；
+# 其余各节由规范维护窗口和用户在对话里补齐。兼容 macOS 自带的 bash 3.2；系统差异集中在 scripts/lib/compat.sh。
+set -uo pipefail
+
+SELF=$0
+while [ -L "${SELF}" ]; do
+  t=$(readlink "${SELF}")
+  case ${t} in /*) SELF=${t} ;; *) SELF=$(dirname "${SELF}")/${t} ;; esac
+done
+SKILL_DIR=$(cd -P "$(dirname "${SELF}")/.." && pwd -P) || exit 1
+MODELS="${SKILL_DIR}/models.conf"
+PROFILE_REL="docs/agents/loop-profile.md"
+MARK='【待完善】'
+SB='<!-- agent-loop:settings:begin -->'
+SE='<!-- agent-loop:settings:end -->'
+ON='启用'
+OFF='关闭'
+
+die() { echo "$*" >&2; exit 1; }
+# shellcheck source=lib/compat.sh
+. "${SKILL_DIR}/scripts/lib/compat.sh"
+
+# 设置项定义：键|名称|类型|默认值|选项或说明
+defs_raw() {
+  cat <<'EOF'
+coordinator|总控|choice|claude|claude,codex
+launcher|启动器|choice|iterm|iterm
+model.spec|spec模型|model|claude-fable|
+model.tickets|拆票模型|model|claude-fable|
+model.plan|高风险计划模型|model|claude-fable|
+model.dev|开发模型|model|codex-sol-medium|
+model.closing|收尾模型|model|codex-sol-medium|
+model.audit|审计模型|model|codex-astra-high|
+model.merge|合并模型|model|claude-opus|
+model.testdoc|测试流程模型|model|codex-sol-medium|
+window.error-intake|错误对接窗口|toggle|关闭|
+window.maintainer|规范维护窗口|toggle|关闭|
+window.auto-close|自动关窗|toggle|关闭|
+feature.naming|功能命名|choice|建议后确认|建议后确认,总控确定
+stage.discussion|讨论阶段|toggle|启用|
+stage.closing|收尾票|toggle|启用|
+stage.audit|阶段审计|toggle|启用|
+stage.merge|合并窗口|toggle|启用|
+stage.regression|回归测试|toggle|启用|
+flow.auto-continue|自动接续|choice|自动|自动,需确认
+test.mode|测试方式|choice|unified|unified,per-stage
+guard.no-db|会话不连库|toggle|启用|
+guard.ai-files-local|AI文件不提交|toggle|启用|
+guard.feature-flags|新行为放开关后|toggle|启用|
+codex.sandbox|Codex沙箱|choice|danger-full-access|danger-full-access,workspace-write,read-only
+branch.remote|远端|text||
+branch.feature|feature分支|branch||
+branch.shared|共享环境分支|branch||
+window.limit|窗口上限|text||
+worktree.auto-clean|自动清理worktree|toggle|启用|
+EOF
+}
+# 「启动器」的可选值取自 launchers.conf，加一个系统不用改这里
+defs() { defs_raw | awk -F'|' -v OFS='|' -v ids="$(launcher_ids)" '$1 == "launcher" && ids != "" { $5 = ids } { print }'; }
+def_of() { defs | awk -F'|' -v k="$1" '$1==k || $2==k {print; exit}'; }
+field() { echo "$1" | cut -d'|' -f"$2"; }
+
+note_of() {
+  case $1 in
+    coordinator) echo "claude = Claude Code；codex = Codex 命令行（靠常驻监视收通知，见 references/coordinator-codex.md）" ;;
+    launcher) echo "怎么开窗口、关窗口，一个系统一项。清单在 launchers.conf" ;;
+    window.auto-close) echo "启用 = 总控验收某个窗口的结果后自己关掉它；关闭 = 窗口做完后提示可以关闭，由用户关" ;;
+    feature.naming) echo "新建功能目录时：建议后确认 = 总控提出名字，用户确定后才建；总控确定 = 总控自己起名并告知。启动时指定了名字就用指定的" ;;
+    flow.auto-continue) echo "自动 = 票完成后总控自己核对、合入、开下一张；需确认 = 票完成后总控核对完先等用户确认，再合入它和开下一张。用户直接提出的需求写成票后开第一个窗口，两种取值都不用确认" ;;
+    test.mode) echo "unified = 统一回归；per-stage = 每阶段本地测试" ;;
+    guard.no-db) echo "会话只交付脚本，数据库和共享环境由用户操作" ;;
+    guard.ai-files-local) echo "AGENTS.md、CLAUDE.md、docs/agents/ 只留在本机" ;;
+    guard.feature-flags) echo "每阶段可独立上线，新行为默认放在开关后面" ;;
+    codex.sandbox) echo "danger-full-access = 沙箱外运行，审批策略保持默认；另两种模式下 Codex 写不了主工作树里的票文件，也无法在 worktree 里提交" ;;
+    branch.shared) echo "推送后部署到共享环境的分支；留空表示没有" ;;
+    window.limit) echo "同时开着的窗口数；留空表示不限" ;;
+    worktree.auto-clean) echo "启用 = 票合入后删掉它的 worktree（工作区干净才删，只删 worktree、保留分支）；关闭 = 留着，由用户用 agent-loop worktree prune 清理" ;;
+    window.error-intake|window.maintainer) echo "可选窗口，用 agent-loop open 开启" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ---------- 取值的读写（临时文件，每行 键=值） ----------
+VALS=$(mktemp "${TMPDIR:-/tmp}/agent-loop.XXXXXX") || exit 1
+trap 'rm -f "${VALS}" "${VALS}".*' EXIT
+getv() { awk -v k="$1" 'index($0, k"=")==1 {print substr($0, length(k)+2); exit}' "${VALS}"; }
+setv() {
+  awk -v k="$1" 'index($0, k"=")!=1' "${VALS}" > "${VALS}.n"; mv "${VALS}.n" "${VALS}"
+  printf '%s=%s\n' "$1" "$2" >> "${VALS}"
+}
+
+# ---------- 模型清单 ----------
+model_line() { grep -v '^#' "${MODELS}" | awk -F'|' -v k="$1" '$1==k {print; exit}'; }
+model_label() {
+  case $1 in custom:*) echo "自定义" ;; *) l=$(model_line "$1"); [ -n "${l}" ] && field "${l}" 3 || echo "$1（清单里没有）" ;; esac
+}
+model_engine() {
+  case $1 in
+    custom:claude*) echo claude ;;
+    custom:*) echo file ;;
+    *) l=$(model_line "$1"); [ -n "${l}" ] && field "${l}" 2 || echo file ;;
+  esac
+}
+model_cmd() {
+  case $1 in
+    custom:*) c=${1#custom:} ;;
+    *) l=$(model_line "$1"); c=$(echo "${l}" | cut -d'|' -f4-) ;;
+  esac
+  c=$(echo "${c}" | sed "s/{sandbox}/$(getv codex.sandbox)/")
+  # Codex 启动时的更新提示会挡住新窗口、丢掉初始提示：只在这一次启动上关掉更新检查，不动用户的全局设置。
+  # 这个设置能不能去掉那个提示没有证实，真正的保障是窗口签到（agent-loop window hello）
+  case ${c} in "codex "*) c="codex -c check_for_update_on_startup=false ${c#codex }" ;; esac
+  echo "${c}"
+}
+
+# ---------- 仓库与参数文件 ----------
+# 参数文件只有主工作树里的一份：在任何 worktree 里运行，都定位到主工作树
+repo_root() {
+  git rev-parse --show-toplevel >/dev/null 2>&1 || die "当前目录不在 git 仓库里。请在项目目录中运行。"
+  main=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
+  [ -n "${main}" ] || main=$(git rev-parse --show-toplevel)
+  here=$(git rev-parse --show-toplevel)
+  [ "${here}" != "${main}" ] && echo "当前在 worktree 里，参数文件在主工作树：${main}" >&2
+  echo "${main}"
+}
+# 写进文件的 skill 路径用 ~ 开头，不带本机的用户目录
+skill_ref() { case ${SKILL_DIR} in "${HOME}"/*) echo "~${SKILL_DIR#"${HOME}"}" ;; *) echo "${SKILL_DIR}" ;; esac; }
+todo_count() { grep -cF "${MARK}" "$1"; }
+load_defaults() {
+  : > "${VALS}"
+  defs | while IFS='|' read -r k _ _ d _; do printf '%s=%s\n' "${k}" "${d}"; done >> "${VALS}"
+  r=$(git remote 2>/dev/null | head -1); [ -n "${r}" ] && setv branch.remote "${r}"
+  b=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); [ -n "${b}" ] && [ "${b}" != HEAD ] && setv branch.feature "${b}"
+}
+load_profile() {
+  # 读「设置」表：| 名称 | 键 | 取值 | 说明 |
+  awk -v sb="${SB}" -v se="${SE}" '
+    index($0, sb) {on=1; next} index($0, se) {on=0}
+    on && /^\|/ { n=split($0, f, "|"); if (n>=5) { k=f[3]; v=f[4]; gsub(/^[ \t`]+|[ \t`]+$/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", v); if (k!="键" && k!~/^-+$/) print k "=" v } }
+  ' "$1" > "${VALS}.p"
+  while IFS= read -r line; do
+    k=${line%%=*}; v=${line#*=}
+    [ -n "$(def_of "${k}")" ] && setv "${k}" "${v}"
+  done < "${VALS}.p"
+}
+render_table() {
+  echo "${SB}"
+  echo "| 项 | 键 | 取值 | 说明 |"
+  echo "| --- | --- | --- | --- |"
+  defs | while IFS='|' read -r k name type _ _; do
+    v=$(getv "${k}")
+    if [ "${type}" = model ]; then
+      c=$(model_cmd "${v}")
+      [ "${k}" = model.plan ] && [ "$(model_engine "${v}")" = claude ] && c="${c} --permission-mode plan"
+      note="$(model_label "${v}")：\`${c}\`"
+    else
+      note=$(note_of "${k}")
+    fi
+    echo "| ${name} | \`${k}\` | ${v} | ${note} |"
+  done
+  echo "${SE}"
+}
+write_profile() {
+  repo=$1; profile="${repo}/${PROFILE_REL}"
+  render_table > "${VALS}.t"
+  if [ -f "${profile}" ]; then
+    grep -qF "${SB}" "${profile}" || die "参数文件里找不到「设置」表的标记，无法更新：${profile}"
+    awk -v sb="${SB}" -v se="${SE}" -v tf="${VALS}.t" '
+      index($0, sb) { while ((getline l < tf) > 0) print l; skip=1; next }
+      index($0, se) { skip=0; next }
+      !skip' "${profile}" > "${VALS}.o" && cat "${VALS}.o" > "${profile}"
+  else
+    mkdir -p "$(dirname "${profile}")"
+    awk -v tf="${VALS}.t" -v name="$(basename "${repo}")" -v skill="$(skill_ref)" '
+      $0=="{{SETTINGS}}" { while ((getline l < tf) > 0) print l; next }
+      { gsub(/\{\{REPONAME\}\}/, name); gsub(/\{\{SKILL\}\}/, skill); print }' "${SKILL_DIR}/templates/profile.md" > "${profile}"
+  fi
+}
+# 变更记录写在「## 变更记录」一节的末尾（下一个二级标题之前）；没有这一节时在文件末尾新建
+log_change() {
+  f="$1/${PROFILE_REL}"
+  line=$(printf -- '- %s：%s（由 agent-loop 命令修改）' "$(date '+%Y-%m-%d %H:%M')" "$2")
+  if grep -q '^## 变更记录' "${f}"; then
+    awk -v line="${line}" '
+      function flush() { for (i = 1; i <= n - blanks; i++) print buf[i]; print line; for (i = n - blanks + 1; i <= n; i++) print buf[i]; n = 0; blanks = 0 }
+      insec && /^## / { flush(); insec = 0 }
+      insec { buf[++n] = $0; if ($0 == "") blanks++; else blanks = 0; next }
+      { print }
+      /^## 变更记录/ { insec = 1; n = 0; blanks = 0 }
+      END { if (insec) flush() }' "${f}" > "${VALS}.o" && cat "${VALS}.o" > "${f}"
+  else
+    printf '\n## 变更记录\n\n%s\n' "${line}" >> "${f}"
+  fi
+}
+
+# ---------- 提问 ----------
+ask() { printf '%s' "$1" >&2; IFS= read -r REPLY || REPLY=""; }
+ask_choice() {  # 键 名称 选项（逗号分隔）
+  cur=$(getv "$1"); i=0
+  echo >&2; echo "${2}（当前：${cur:-空}）$( n=$(note_of "$1"); [ -n "${n}" ] && echo "  ${n}" )" >&2
+  for o in $(echo "$3" | tr ',' ' '); do i=$((i+1)); echo "  ${i}. ${o}" >&2; done
+  ask "  选择编号，回车保持不变："
+  [ -z "${REPLY}" ] && return 0
+  o=$(echo "$3" | tr ',' '\n' | sed -n "${REPLY}p" 2>/dev/null)
+  [ -n "${o}" ] || { echo "  无效的编号，保持不变。" >&2; return 0; }
+  setv "$1" "${o}"
+}
+ask_model() {
+  cur=$(getv "$1"); i=0
+  echo >&2; echo "${2}（当前：$(model_label "${cur}")）" >&2
+  grep -v '^#' "${MODELS}" | while IFS='|' read -r id _ label _; do i=$((i+1)); echo "  ${i}. ${label}  [${id}]" >&2; done
+  n=$(grep -vc '^#' "${MODELS}"); echo "  $((n+1)). 自定义（手填启动命令）" >&2
+  ask "  选择编号，回车保持不变："
+  [ -z "${REPLY}" ] && return 0
+  if [ "${REPLY}" = "$((n+1))" ]; then
+    ask "  启动命令（不含初始提示）："
+    [ -n "${REPLY}" ] && setv "$1" "custom:${REPLY}"
+    return 0
+  fi
+  id=$(grep -v '^#' "${MODELS}" | sed -n "${REPLY}p" 2>/dev/null | cut -d'|' -f1)
+  [ -n "${id}" ] && setv "$1" "${id}" || echo "  无效的编号，保持不变。" >&2
+}
+ask_toggle() {
+  cur=$(getv "$1"); n=$(note_of "$1")
+  echo >&2; ask "${2}（当前：${cur}）$( [ -n "${n}" ] && echo "  ${n}" )  y 启用 / n 关闭 / 回车保持不变："
+  case ${REPLY} in y|Y) setv "$1" "${ON}" ;; n|N) setv "$1" "${OFF}" ;; esac
+}
+ask_text() {
+  cur=$(getv "$1"); n=$(note_of "$1")
+  echo >&2; ask "${2}（当前：${cur:-空}）$( [ -n "${n}" ] && echo "  ${n}" )  输入新值，- 清空，回车保持不变："
+  case ${REPLY} in "") ;; -) setv "$1" "" ;; *) setv "$1" "${REPLY}" ;; esac
+}
+ask_branch() {
+  cur=$(getv "$1"); n=$(note_of "$1"); i=0
+  echo >&2; echo "${2}（当前：${cur:-空}）$( [ -n "${n}" ] && echo "  ${n}" )" >&2
+  git for-each-ref --format='%(refname:short)' refs/heads | head -30 > "${VALS}.b"
+  while IFS= read -r b; do i=$((i+1)); echo "  ${i}. ${b}" >&2; done < "${VALS}.b"
+  ask "  选择编号，或直接输入分支名，- 清空，回车保持不变："
+  case ${REPLY} in
+    "") ;;
+    -) setv "$1" "" ;;
+    *[!0-9]*) setv "$1" "${REPLY}" ;;
+    *) b=$(sed -n "${REPLY}p" "${VALS}.b"); [ -n "${b}" ] && setv "$1" "${b}" || echo "  无效的编号，保持不变。" >&2 ;;
+  esac
+}
+ask_item() {
+  d=$(def_of "$1"); k=$(field "${d}" 1); name=$(field "${d}" 2); type=$(field "${d}" 3)
+  case ${type} in
+    choice) ask_choice "${k}" "${name}" "$(field "${d}" 5)" ;;
+    model) ask_model "${k}" "${name}" ;;
+    toggle) ask_toggle "${k}" "${name}" ;;
+    branch) ask_branch "${k}" "${name}" ;;
+    *) ask_text "${k}" "${name}" ;;
+  esac
+}
+# 直接赋值时的校验与归一
+normalize() {  # 键 值 → 打印归一后的值；无效时返回 1
+  d=$(def_of "$1"); type=$(field "${d}" 3)
+  case ${type} in
+    toggle) case $2 in 启用|on|y|yes|true) echo "${ON}" ;; 关闭|off|n|no|false) echo "${OFF}" ;; *) return 1 ;; esac ;;
+    choice) echo ",$(field "${d}" 5)," | grep -qF ",$2," || return 1
+            echo "$2" ;;
+    model) case $2 in custom:?*) echo "$2" ;; *) [ -n "$(model_line "$2")" ] && echo "$2" || return 1 ;; esac ;;
+    *) case $2 in *"|"*) return 1 ;; -) echo "" ;; *) echo "$2" ;; esac ;;
+  esac
+}
+
+# ---------- 环境检查 ----------
+cmd_check() {
+  echo "环境依赖："
+  for c in git claude codex; do
+    if p=$(command -v "${c}" 2>/dev/null); then echo "  [有] ${c}：${p}"; else echo "  [缺] ${c}"; fi
+  done
+  lr=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')
+  if [ -n "${lr}" ] && [ -f "${lr}/${PROFILE_REL}" ]; then load_defaults; load_profile "${lr}/${PROFILE_REL}"; fi
+  l=$(getv launcher); l=${l:-$(field "$(def_of launcher)" 4)}
+  if [ -z "$(launcher_line "${l}")" ]; then echo "  [注意] 启动器 ${l}：launchers.conf 里没有这一项"
+  elif launcher_installed "${l}"; then echo "  [有] 启动器 ${l}：$(launcher_name "${l}")"
+  else echo "  [缺] 启动器 ${l}：这台机器上没有 $(launcher_name "${l}")，开窗命令只会打印启动命令，由用户手动开终端"; fi
+  cm=$(ls -d "${HOME}"/.claude/plugins/cache/*/mattpocock-skills/*/skills/engineering/wayfinder 2>/dev/null | tail -1)
+  xm="${HOME}/.agents/skills/wayfinder"
+  [ -n "${cm}" ] && echo "  [有] mattpocock skill（Claude）：${cm%/skills/engineering/wayfinder}" || echo "  [缺] mattpocock skill（Claude）：/wayfinder、/to-spec、/to-tickets、/implement 需要它"
+  [ -d "${xm}" ] && echo "  [有] mattpocock skill（Codex）：${HOME}/.agents/skills" || echo "  [缺] mattpocock skill（Codex）：Codex 窗口用不到讨论和拆票时可以不装"
+  if [ -n "${cm}" ] && [ -d "${xm}" ] && ! cmp -s "${cm}/SKILL.md" "${xm}/SKILL.md"; then
+    echo "  [注意] Claude 和 Codex 的 mattpocock skill 版本不一致，建议更新 Codex 那份"
+  fi
+  if [ -L "${HOME}/.agents/skills/agent-loop" ] || [ -d "${HOME}/.agents/skills/agent-loop" ]; then echo "  [有] Codex 可见本 skill"; else echo "  [缺] Codex 看不到本 skill：运行 ${SKILL_DIR}/scripts/install.sh"; fi
+  # 「用户维护的文档」是个人的需求文档，应当只留本机：列在这一项里却在 Git 里的文件要提醒
+  if [ -n "${lr}" ] && [ -f "${lr}/${PROFILE_REL}" ]; then
+    grep -m1 '^- 用户维护的文档' "${lr}/${PROFILE_REL}" | sed 's/^[^：]*：//' | tr '`' '\n' | awk 'NR % 2 == 0' > "${VALS}.ud"
+    while IFS= read -r uf; do
+      [ -n "${uf}" ] && [ -e "${lr}/${uf}" ] || continue
+      if [ -n "$(git -C "${lr}" ls-files -- "${uf}" | head -1)" ]; then
+        echo "  [注意] 用户维护的文档 ${uf} 在 Git 里。它应当只留本机：请决定把它移出 Git，还是把它当作团队文档、只通过票来改"
+      fi
+    done < "${VALS}.ud"
+  fi
+  # 监视：每个有记录的功能报告一行。Codex 总控的常驻监视应当一直在；Claude 总控的等待在它处理事情的时候不在，属正常
+  if [ -n "${lr}" ] && [ -f "${lr}/${PROFILE_REL}" ]; then
+    co=$(getv coordinator)
+    # 台账里还开着、标签页却已经不在的窗口：登记为关闭并列出来
+    for d in "${lr}/$(task_dir "${lr}")"/*/ledger; do
+      [ -s "${d}/windows.tsv" ] || continue
+      WIN="${d}/windows.tsv"; win_sweep
+    done
+    for d in "${lr}/$(task_dir "${lr}")"/*/ledger; do
+      [ -f "${d}/watch.state" ] || continue
+      f=$(basename "$(dirname "${d}")")
+      rp=$(cat "${d}/watch.pid" 2>/dev/null); pid_alive "${rp}" || rp=""
+      wp=$(cat "${d}/watch.wait.lock/pid" 2>/dev/null); pid_alive "${wp}" || wp=""
+      if [ "${co}" = codex ]; then
+        if [ -n "${rp}" ]; then echo "  [有] 监视：功能 ${f}，Codex 总控的常驻监视在运行（进程 ${rp}）"
+        else echo "  [缺] 监视：功能 ${f} 的常驻监视没有在运行，Codex 总控收不到通知。请总控运行 agent-loop watch restart --thread <会话ID> --feature ${f}"; fi
+        [ -z "${wp}" ] || echo "  [注意] 监视：功能 ${f} 还挂着一个 Claude 总控的等待（进程 ${wp}），和常驻监视不能同时用。agent-loop watch restart 会停掉它"
+      else
+        if [ -n "${wp}" ]; then echo "  [有] 监视：功能 ${f}，Claude 总控的等待挂着（进程 ${wp}）"
+        else echo "  [提示] 监视：功能 ${f} 现在没有等待挂着。总控正在处理事情时属正常；它空闲着而窗口还在干活时，请对它说一声「挂上监视」"; fi
+        [ -z "${rp}" ] || echo "  [注意] 监视：功能 ${f} 还有 Codex 总控的常驻监视在运行（进程 ${rp}）。请 Claude 总控运行 agent-loop watch wait --restart --feature ${f}"
+      fi
+    done
+  fi
+}
+
+# 任务目录：取参数文件「路径」一节里「任务目录」那一行的第一个反引号内容，默认 .scratch
+task_dir() {
+  d=""
+  [ -f "$1/${PROFILE_REL}" ] && d=$(grep -m1 '^- 任务目录' "$1/${PROFILE_REL}" | sed -n 's/^[^`]*`\([^`]*\)`.*/\1/p')
+  d=${d%/}; echo "${d:-.scratch}"
+}
+
+# ---------- 索引与本机排除 ----------
+tracked() { git -C "$1" ls-files --error-unmatch -- "$2" >/dev/null 2>&1; }
+add_index() {
+  repo=$1; interactive=$2
+  if [ -f "${repo}/CLAUDE.md" ] && ! grep -q '^@AGENTS.md' "${repo}/CLAUDE.md"; then target=CLAUDE.md
+  elif [ -f "${repo}/AGENTS.md" ]; then target=AGENTS.md
+  else target=AGENTS.md; : > "${repo}/AGENTS.md"; echo "已创建 AGENTS.md"; fi
+  f="${repo}/${target}"
+  if grep -q '^### Agent loop' "${f}"; then echo "索引已存在：${target}"
+  else
+    if tracked "${repo}" "${target}"; then
+      if [ "${interactive}" = yes ]; then
+        ask "${target} 已被 git 跟踪，加索引会进入团队仓库。继续？y / n："
+        case ${REPLY} in y|Y) ;; *) echo "已跳过索引。需要时手动把 ${SKILL_DIR}/templates/index-block.md 的内容加进 ${target}。"; return 0 ;; esac
+      else
+        echo "${target} 已被 git 跟踪，未改动。需要时手动加入 ${SKILL_DIR}/templates/index-block.md 的内容。"; return 0
+      fi
+    fi
+    sed "s|{{SKILL}}|$(skill_ref)|g" "${SKILL_DIR}/templates/index-block.md" > "${VALS}.i"
+    if grep -q '^## Agent skills' "${f}"; then
+      # 插在「## Agent skills」一节的末尾（下一个二级标题之前）
+      awk -v bf="${VALS}.i" '
+        function emit() { while ((getline l < bf) > 0) print l; print ""; done=1 }
+        /^## / { if (insec && !done) emit(); insec = ($0 ~ /^## Agent skills/) }
+        { print }
+        END { if (insec && !done) { print ""; emit() } }' "${f}" > "${VALS}.o" && cat "${VALS}.o" > "${f}"
+    else
+      { [ -s "${f}" ] && echo; echo "## Agent skills"; echo; cat "${VALS}.i"; } >> "${f}"
+    fi
+    echo "已在 ${target} 加入索引（### Agent loop）"
+  fi
+  # 让 Claude 和 Codex 都读得到
+  if [ ! -f "${repo}/CLAUDE.md" ]; then echo '@AGENTS.md' > "${repo}/CLAUDE.md"; echo "已创建 CLAUDE.md（指向 AGENTS.md）"; fi
+  if [ ! -f "${repo}/AGENTS.md" ]; then echo 'Read `CLAUDE.md` in this directory and follow it.' > "${repo}/AGENTS.md"; echo "已创建 AGENTS.md（指向 CLAUDE.md）"; fi
+}
+add_exclude() {
+  repo=$1
+  [ "$(getv guard.ai-files-local)" = "${ON}" ] || return 0
+  ex="$(cd "${repo}" && git rev-parse --git-common-dir)/info/exclude"
+  case ${ex} in /*) ;; *) ex="${repo}/${ex}" ;; esac
+  mkdir -p "$(dirname "${ex}")"; touch "${ex}"
+  for p in AGENTS.md CLAUDE.md docs/agents/ "$(task_dir "${repo}")/"; do
+    if [ -n "$(git -C "${repo}" ls-files -- "${p}" | head -1)" ]; then echo "本机排除：${p} 已被 git 跟踪，跳过"; continue; fi
+    grep -qxF "/${p}" "${ex}" || { echo "/${p}" >> "${ex}"; echo "本机排除：已加入 /${p}"; }
+  done
+}
+
+# 「AI文件不提交」只有个人项目才允许关闭：团队仓库里这些文件必须只留在本机
+confirm_personal() {
+  [ "$1" = --personal ] && return 0
+  ask "只有你的个人项目才允许关闭这一项；团队仓库必须保持启用。这是个人项目吗？y / n："
+  case ${REPLY} in y|Y) return 0 ;; *) return 1 ;; esac
+}
+
+# 沙箱内的 Codex 只能写自己的工作目录：票文件在主工作树、worktree 的 git 数据在主仓库的 .git 里，都写不了
+warn_sandbox() {
+  [ "$(getv codex.sandbox)" = danger-full-access ] && return 0
+  for k in model.dev model.closing model.audit model.testdoc model.plan model.spec model.tickets model.merge; do
+    case $(getv "${k}") in codex-*|custom:codex*)
+      echo "注意：Codex沙箱是「$(getv codex.sandbox)」，而有环节用了 Codex。沙箱内的 Codex 写不了主工作树里的票文件，也无法在 worktree 里提交，回报和完成都会卡住。要用 Codex 窗口，请设为 danger-full-access。" >&2
+      return 0 ;;
+    esac
+  done
+}
+
+# ---------- 子命令 ----------
+need_profile() {
+  REPO=$(repo_root) || exit 1
+  [ -f "${REPO}/${PROFILE_REL}" ] || die "这个项目还没有初始化。请先运行：agent-loop init"
+  load_defaults; load_profile "${REPO}/${PROFILE_REL}"
+}
+cmd_show() {
+  need_profile
+  echo "参数文件：${REPO}/${PROFILE_REL}"; echo
+  render_table | grep '^|'
+  n=$(todo_count "${REPO}/${PROFILE_REL}")
+  echo; [ "${n}" -gt 0 ] && echo "还有 ${n} 项待完善，由规范维护窗口在对话里补齐：agent-loop open 规范维护" || echo "没有待完善的项。"
+}
+cmd_init() {
+  defaults=no; noopen=no
+  for a in "$@"; do case ${a} in --defaults) defaults=yes ;; --no-open) noopen=yes ;; *) die "未知参数：${a}" ;; esac; done
+  REPO=$(repo_root) || exit 1
+  if [ ! -f "${REPO}/docs/agents/issue-tracker.md" ]; then
+    echo "这个项目还没有跑过 mattpocock 的初始化（找不到 docs/agents/issue-tracker.md）。" >&2
+    echo "流程依赖它的票目录约定。请先在项目里运行一次（Claude 或 Codex 任选其一），票的位置选本地 markdown：" >&2
+    echo "  Claude Code：/setup-matt-pocock-skills" >&2
+    echo "  Codex：      \$setup-matt-pocock-skills" >&2
+    exit 3
+  fi
+  grep -qiE 'github issues|gitlab issues|gh issue|glab issue' "${REPO}/docs/agents/issue-tracker.md" && \
+    die "这个项目的票放在 GitHub 或 GitLab 上。当前版本只支持本地 markdown 的票（总控靠盯票文件发现完成和待裁决）。"
+  cmd_check; echo
+  load_defaults
+  existing=no
+  if [ -f "${REPO}/${PROFILE_REL}" ]; then existing=yes; load_profile "${REPO}/${PROFILE_REL}"; echo "已有参数文件，现有取值作为预填。"; fi
+  cp "${VALS}" "${VALS}.before"
+  if [ "${defaults}" = no ]; then
+    echo "逐项设置。直接回车接受当前值。"
+    for k in $(defs | cut -d'|' -f1); do
+      ask_item "${k}"
+      if [ "${k}" = guard.ai-files-local ] && [ "$(getv "${k}")" = "${OFF}" ] && \
+         [ "$(awk -v k="${k}" 'index($0, k"=")==1 {print substr($0, length(k)+2); exit}' "${VALS}.before")" = "${ON}" ]; then
+        confirm_personal "" || { setv "${k}" "${ON}"; echo "  保持启用。" >&2; }
+      fi
+    done
+    echo; echo "汇总："; render_table | grep '^|'
+    ask "写入参数文件？y / n："
+    case ${REPLY} in y|Y) ;; *) echo "已取消，没有写入任何文件。"; exit 0 ;; esac
+  fi
+  write_profile "${REPO}"
+  warn_sandbox
+  if [ "${existing}" = yes ]; then
+    for k in $(defs | cut -d'|' -f1); do
+      o=$(awk -v k="${k}" 'index($0, k"=")==1 {print substr($0, length(k)+2); exit}' "${VALS}.before"); n=$(getv "${k}")
+      [ "${o}" != "${n}" ] && log_change "${REPO}" "$(field "$(def_of "${k}")" 2) 由「${o:-空}」改为「${n:-空}」"
+    done
+  else
+    log_change "${REPO}" "初始化，生成参数文件"
+  fi
+  echo "参数文件：${REPO}/${PROFILE_REL}"
+  add_index "${REPO}" "$( [ "${defaults}" = no ] && echo yes || echo no )"
+  add_exclude "${REPO}"
+  n=$(todo_count "${REPO}/${PROFILE_REL}")
+  if [ "${n}" -gt 0 ]; then
+    echo; echo "还有 ${n} 项需要在对话里补齐（规范维护窗口）。"
+    if [ "${noopen}" = no ] && [ "${defaults}" = no ]; then
+      ask "现在开启规范维护窗口？y / n："
+      case ${REPLY} in y|Y) open_window maintainer init no; return ;; esac
+    fi
+    echo "稍后开启：agent-loop open 规范维护"
+  else
+    echo "没有待完善的项。可以在 Claude Code 里运行 /agent-loop 启动总控。"
+  fi
+}
+cmd_set() {
+  need_profile
+  if [ $# -eq 0 ]; then
+    i=0; defs | while IFS='|' read -r k name _ _ _; do i=$((i+1)); printf '  %2d. %s：%s\n' "${i}" "${name}" "$(getv "${k}")"; done
+    ask "修改哪一项？输入编号："
+    key=$(defs | sed -n "${REPLY}p" 2>/dev/null | cut -d'|' -f1); [ -n "${key}" ] || die "无效的编号。"
+    set -- "${key}"
+  fi
+  d=$(def_of "$1"); [ -n "${d}" ] || die "没有这一项：$1。用 agent-loop show 查看所有项。"
+  k=$(field "${d}" 1); name=$(field "${d}" 2); old=$(getv "${k}")
+  if [ $# -ge 2 ]; then
+    v=$(normalize "${k}" "$2") || die "「$2」不是${name}的有效取值。"
+    setv "${k}" "${v}"
+  else
+    ask_item "${k}"
+  fi
+  new=$(getv "${k}")
+  if [ "${k}" = guard.ai-files-local ] && [ "${old}" = "${ON}" ] && [ "${new}" = "${OFF}" ]; then
+    confirm_personal "${3:-}" || { echo "已取消，${name}保持启用。"; return 0; }
+  fi
+  if [ "${old}" = "${new}" ]; then echo "${name}没有变化：${old:-空}"; return 0; fi
+  write_profile "${REPO}"
+  log_change "${REPO}" "${name} 由「${old:-空}」改为「${new:-空}」"
+  echo "${name}：${old:-空} → ${new:-空}"
+  warn_sandbox
+  echo "从总控下一次开窗起生效，已经在运行的窗口不变。"
+}
+open_window() {  # 窗口(maintainer|error-intake) 任务(init|normal) 只打印(yes|no)
+  w=$1; task=$2; print=$3; profile="${REPO}/${PROFILE_REL}"
+  case ${w} in maintainer) wname="规范维护窗口" ;; *) wname="错误对接窗口" ;; esac
+  if [ "${task}" != init ] && [ "$(getv "window.${w}")" != "${ON}" ]; then
+    die "${wname}没有启用。启用：agent-loop set ${wname} 启用"
+  fi
+  # 这两个窗口的模型跟着总控走
+  case $(getv coordinator) in codex) mid=codex-astra-high ;; *) mid=claude-fable ;; esac
+  cmd=$(model_cmd "${mid}")
+  sid=$(grep -F -- "- ${wname}：" "${profile}" | tail -1 | sed -n 's/.*sessionId：\([0-9a-fA-F-]\{36\}\).*/\1/p')
+  pf=-
+  if [ -n "${sid}" ]; then
+    # 会话还在运行时不再开第二份：~/.claude/sessions/<pid>.json 记着在线会话
+    if pid=$(session_pid "${sid}"); then
+      echo "${wname}已经在运行（会话 ${sid}，进程 ${pid}），没有重复开启。请切到那个标签页。"
+      return 0
+    fi
+  fi
+  if [ -n "${sid}" ] && [ "${mid}" = claude-fable ] && ls "${HOME}"/.claude/projects/*/"${sid}".jsonl >/dev/null 2>&1; then
+    cmd="${cmd} --resume ${sid}"
+    echo "恢复已登记的${wname}会话：${sid}"
+  else
+    pf="${TMPDIR:-/tmp}/agent-loop-${w}-$$.prompt"
+    case ${w} in
+      maintainer)
+        if [ "${task}" = init ]; then tf="${SKILL_DIR}/templates/maintainer-task-init.md"; else tf=/dev/null; fi
+        awk -v tf="${tf}" -v repo="${REPO}" -v skill="${SKILL_DIR}" -v profile="${profile}" '
+          $0=="{{TASK}}" { while ((getline l < tf) > 0) print l; next }
+          { gsub(/\{\{REPO\}\}/, repo); gsub(/\{\{SKILL\}\}/, skill); gsub(/\{\{PROFILE\}\}/, profile); print }' \
+          "${SKILL_DIR}/templates/maintainer-prompt.md" > "${pf}" ;;
+      *)
+        awk -v repo="${REPO}" -v skill="${SKILL_DIR}" -v profile="${profile}" '
+          { gsub(/\{\{REPO\}\}/, repo); gsub(/\{\{SKILL\}\}/, skill); gsub(/\{\{PROFILE\}\}/, profile); print }' \
+          "${SKILL_DIR}/templates/error-intake-prompt.md" > "${pf}" ;;
+    esac
+  fi
+  nsid=-
+  if [ "${pf}" != - ] && [ "$(cli_of "${cmd}")" = claude ]; then nsid=$(new_uuid); cmd="${cmd} --session-id ${nsid}"; fi
+  if [ "${print}" = yes ]; then print_manual "${REPO}" "${pf}" "${cmd}"; return 0; fi
+  # 可选窗口属于整个项目，不属于某个功能：登记在项目级的记录里，用量按窗口名单独显示。
+  # 新开的会话登记一行；恢复的会话如果还没登记过（旧版本开的），补登记
+  scope_project
+  rsid=${nsid}; [ "${pf}" = - ] && rsid=${sid}
+  if [ "${rsid}" = - ] || ! grep -qF "${TAB}${rsid}${TAB}" "${WIN}"; then
+    wid=$(win_add - - "${w}" "${mid}" "$(cli_of "${cmd}")" "${REPO}" "${rsid}")
+  else
+    wid=""
+  fi
+  if ! launcher_ok; then print_manual "${REPO}" "${pf}" "${cmd}"; return 0; fi
+  # shellcheck disable=SC2086
+  winid=$(launch "${REPO}" "${pf}" ${cmd}) || die "开窗失败。"
+  [ -n "${wid}" ] && [ -n "${winid}" ] && { win_set "${wid}" 11 "${winid}"; win_set "${wid}" 12 "$(getv launcher)"; }
+  echo "已开启${wname}。"
+}
+cmd_open() {
+  [ $# -ge 1 ] || die "用法：agent-loop open <规范维护|错误对接> [--print]"
+  need_profile
+  case $1 in 规范维护|规范维护窗口|maintainer) w=maintainer ;; 错误对接|错误对接窗口|error-intake) w=error-intake ;; *) die "没有这个窗口：$1。可选：规范维护、错误对接" ;; esac
+  print=no; [ "${2:-}" = --print ] && print=yes
+  task=normal
+  # 还有待完善项时，规范维护窗口带上补齐任务，并且不要求先启用
+  if [ "${w}" = maintainer ]; then
+    [ "$(todo_count "${REPO}/${PROFILE_REL}")" -gt 0 ] && task=init
+  fi
+  open_window "${w}" "${task}" "${print}"
+}
+# 会话是否在运行：~/.claude/sessions/<pid>.json 记着在线会话
+session_pid() {
+  for sf in "${HOME}"/.claude/sessions/*.json; do
+    [ -f "${sf}" ] || continue
+    grep -qF "\"$1\"" "${sf}" || continue
+    pid=$(basename "${sf}" .json)
+    kill -0 "${pid}" 2>/dev/null && { echo "${pid}"; return 0; }
+  done
+  return 1
+}
+cmd_start() {
+  need_profile
+  name=""; print=no; fresh=no
+  for a in "$@"; do case ${a} in --print) print=yes ;; --new) fresh=yes ;; -*) die "未知参数：${a}" ;; *) name=${a} ;; esac; done
+  n=$(todo_count "${REPO}/${PROFILE_REL}")
+  [ "${n}" -gt 0 ] && die "参数文件里还有 ${n} 项待完善，总控不会派工。先补齐：agent-loop open 规范维护"
+  co=$(getv coordinator); mid=$(coordinator_model); cmd=$(model_cmd "${mid}")
+  td="${REPO}/$(task_dir "${REPO}")"
+  sid=""; fd=""
+  if [ -n "${name}" ]; then
+    case ${name} in *[!A-Za-z0-9._-]*|.*) die "功能名只用英文字母、数字、点、下划线和连字符：${name}" ;; esac
+    fd="${td}/${name}"
+    if [ -d "${fd}" ]; then
+      echo "接续功能：${name}（${fd}）"
+      if [ "${co}" = codex ]; then
+        c=$(cat "${fd}/ledger/coordinator" 2>/dev/null); case ${c} in codex\|?*) sid=${c#*|} ;; esac
+      else
+        for f in "${fd}/dev-plan.md" "${fd}/map.md"; do
+          [ -f "${f}" ] || continue
+          sid=$(grep -m1 -F "总控会话：" "${f}" | sed -n 's/.*sessionId：\([0-9a-fA-F-]\{36\}\).*/\1/p')
+          [ -n "${sid}" ] && break
+        done
+      fi
+    else
+      echo "新建功能：${name}"
+      echo "  一个功能是一个能整体验收的目标，通常是一个大的功能模块，对应一份开发计划、一个总控、一条修复分支。"
+      echo "  同一目标下相互依赖的几块工作是它的阶段；互不依赖的目标是不同的功能；对已发布功能的修补和小需求是它的票。"
+      if [ "${print}" = no ]; then
+        ask "  确认新建这个功能？y / n："
+        case ${REPLY} in y|Y) ;; *) echo "已取消。"; return 0 ;; esac
+        mkdir -p "${fd}"
+      fi
+    fi
+  else
+    echo "没有指定功能名，由总控按规则确定（任务目录：${td}）。"
+  fi
+  # --new：不恢复登记的会话，开一个全新的总控会话接手。状态都在文件里，新会话照「启动」步骤读一遍即可
+  if [ "${fresh}" = yes ] && [ -n "${sid}" ]; then echo "不恢复登记的会话（${sid}），开一个新的总控会话接手。请先关掉旧的总控窗口，避免两个总控同时工作。"; sid=""; fi
+  pf=-; nsid=-
+  if [ "${co}" = codex ]; then
+    if [ -n "${sid}" ] && ls "$(codex_root)"/*/*/*/rollout-*-"${sid}".jsonl >/dev/null 2>&1; then
+      cmd="codex resume ${sid} ${cmd#codex }"
+      echo "恢复登记的 Codex 总控会话：${sid}。恢复后请对它说一句「继续」，它会重新核对状态。"
+    else
+      sid=""
+      pf="${TMPDIR:-/tmp}/agent-loop-coordinator-$$.prompt"
+      awk -v repo="${REPO}" -v skill="${SKILL_DIR}" -v feature="${name:-（没有指定，按入口文件「启动」第 5 步确定）}" '
+        { gsub(/\{\{REPO\}\}/, repo); gsub(/\{\{SKILL\}\}/, skill); gsub(/\{\{FEATURE\}\}/, feature); print }' \
+        "${SKILL_DIR}/templates/codex-coordinator-prompt.md" > "${pf}"
+    fi
+  else
+    if [ -n "${sid}" ]; then
+      if pid=$(session_pid "${sid}"); then
+        echo "这个功能的总控已经在运行（会话 ${sid}，进程 ${pid}），没有重复开启。请切到那个标签页。"
+        return 0
+      fi
+      if ls "${HOME}"/.claude/projects/*/"${sid}".jsonl >/dev/null 2>&1; then
+        cmd="${cmd} --resume ${sid}"
+        echo "恢复登记的总控会话：${sid}。恢复后请对它说一句「继续」，它会重新核对状态并挂上监视。"
+      else
+        sid=""
+      fi
+    fi
+    if [ -z "${sid}" ]; then
+      nsid=$(new_uuid); cmd="${cmd} --session-id ${nsid}"
+      pf="${TMPDIR:-/tmp}/agent-loop-coordinator-$$.prompt"
+      printf '%s' "/agent-loop${name:+ ${name}}" > "${pf}"
+    fi
+  fi
+  if [ "${print}" = yes ] || ! launcher_ok; then
+    if [ "${co}" = claude ] && [ "${pf}" != - ]; then print_manual "${REPO}" "${pf}" "${cmd}" "$(cat "${pf}")"; else print_manual "${REPO}" "${pf}" "${cmd}"; fi
+    return 0
+  fi
+  # 开总控窗口之前，停掉这个功能上残留的监视（上一个总控留下的）。通知记录保留；新的监视由下面或由总控自己启动
+  if [ -n "${fd}" ] && [ -d "${fd}/ledger" ]; then
+    need_feature "${name}"; ledger_init; watch_stop_all
+    [ "${WATCH_STOPPED}" -eq 0 ] || echo "已停掉上一个总控留下的监视（${WATCH_STOPPED} 个进程）。"
+  fi
+  # shellcheck disable=SC2086
+  winid=$(launch "${REPO}" "${pf}" ${cmd}) || die "开窗失败。"
+  echo "已开启总控窗口（$( [ "${co}" = codex ] && echo Codex || echo Claude Code )）。"
+  if [ -n "${fd}" ] && [ -d "${fd}" ]; then
+    need_feature "${name}"; ledger_init
+    if [ -z "${sid}" ]; then
+      # 新开的总控登记到票台账；恢复的会话已经登记过
+      wid=$(win_add - - coordinator "${mid}" "${co}" "${REPO}" "${nsid}")
+      [ -n "${winid}" ] && { win_set "${wid}" 11 "${winid}"; win_set "${wid}" 12 "$(getv launcher)"; }
+      if [ "${co}" = codex ]; then
+        # Codex 的会话 ID 在它启动后才有：后台等它出现，对上之后启动常驻监视
+        ( cd "${REPO}" && detach /bin/bash "${SELF}" watch adopt "${wid}" --feature "${FEATURE}" ) >/dev/null
+        echo "常驻监视会在 Codex 总控启动后自动跟上（agent-loop watch status --feature ${FEATURE} 可以查看）。"
+      fi
+    elif [ "${co}" = codex ]; then
+      # 恢复 Codex 总控时把常驻监视一并拉起来
+      p=$(cd "${REPO}" && detach /bin/bash "${SELF}" watch run --feature "${FEATURE}")
+      echo "${p}" > "${LD}/watch.pid"; echo "常驻监视已启动（进程 ${p}）。"
+    fi
+  fi
+}
+cmd_menu() {
+  echo "agent-loop"
+  echo "  1. 初始化 / 修改全部设置"
+  echo "  2. 修改某一项设置"
+  echo "  3. 启动总控（新建或接续一个功能）"
+  echo "  4. 开启规范维护窗口"
+  echo "  5. 开启错误对接窗口"
+  echo "  6. 查看当前设置"
+  echo "  7. 检查环境依赖"
+  echo "  8. 记一条待办"
+  echo "  9. 查看待办清单"
+  echo " 10. 查看票台账"
+  echo " 11. 查看用量汇总"
+  ask "请选择："
+  case ${REPLY} in
+    1) cmd_init ;; 2) cmd_set ;;
+    3) ask "功能名（直接回车由总控按规则确定）："; if [ -n "${REPLY}" ]; then cmd_start "${REPLY}"; else cmd_start; fi ;;
+    4) cmd_open 规范维护 ;; 5) cmd_open 错误对接 ;; 6) cmd_show ;; 7) cmd_check ;;
+    8) ask "内容："; [ -n "${REPLY}" ] && { t=${REPLY}; ask "这件事以后必须做吗？y = 遗留 / 回车 = 想法："; case ${REPLY} in y|Y) cmd_todo "${t}" --must ;; *) cmd_todo "${t}" ;; esac; } ;;
+    9) cmd_todo ;; 10) cmd_ledger ;; 11) cmd_ledger --summary ;;
+    *) echo "已退出。" ;;
+  esac
+}
+
+# shellcheck source=lib/ledger.sh
+. "${SKILL_DIR}/scripts/lib/ledger.sh"
+. "${SKILL_DIR}/scripts/lib/window.sh"
+. "${SKILL_DIR}/scripts/lib/todo.sh"
+. "${SKILL_DIR}/scripts/lib/watch.sh"
+. "${SKILL_DIR}/scripts/lib/regress.sh"
+. "${SKILL_DIR}/scripts/lib/ticket.sh"
+
+sub=${1:-}; [ $# -gt 0 ] && shift
+case ${sub} in
+  "") cmd_menu ;;
+  init) cmd_init "$@" ;;
+  set) cmd_set "$@" ;;
+  show) cmd_show ;;
+  start) cmd_start "$@" ;;
+  open) cmd_open "$@" ;;
+  check) cmd_check ;;
+  window) cmd_window "$@" ;;
+  ticket) cmd_ticket "$@" ;;
+  worktree) cmd_worktree "$@" ;;
+  send) cmd_send "$@" ;;
+  ledger) cmd_ledger "$@" ;;
+  usage) cmd_ledger --summary "$@" ;;
+  todo) cmd_todo "$@" ;;
+  watch) cmd_watch "$@" ;;
+  regress) cmd_regress "$@" ;;
+  -h|--help|help) awk 'NR>1 && !/^#/ {exit} NR>1 {sub(/^# ?/, ""); print}' "${SELF}" ;;
+  *) die "未知子命令：${sub}。运行 agent-loop --help 查看用法。" ;;
+esac
